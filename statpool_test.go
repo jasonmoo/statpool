@@ -24,7 +24,7 @@ type (
 )
 
 const (
-	EZKey = "yo mam"
+	EZKey = "finchbasket"
 	Host  = ":8000"
 )
 
@@ -37,24 +37,26 @@ func init() {
 		// pass body bytes since req.Body auto-closes on handler end
 		data, _ := ioutil.ReadAll(req.Body)
 		reqs <- data
+		json.NewEncoder(w).Encode(&statResponse{Status: http.StatusOK})
 	})
 	go func() { log.Fatal(http.ListenAndServe(Host, nil)) }()
 }
 
 func TestStatPool(t *testing.T) {
 
-	pool := NewPool("http://"+Host, EZKey, 100*time.Millisecond)
-	pool.SetDevLogger(log.New(os.Stderr, "statpool: ", log.LstdFlags))
+	stats := NewPool("http://"+Host, EZKey, 100*time.Millisecond)
+	stats.SetDevLogger(log.New(os.Stderr, "statpool: ", log.LstdFlags))
+	stats.SetPrefix("prefix:")
 
-	pool.Count("darts", 1)
-	pool.Count("darts", 1)
-	pool.Count("darts", 1)
-	pool.Count("darts", 4)
-	pool.Value("players", 2, time.Now())
-	pool.Duration("quickest time", time.Millisecond, time.Now())
+	stats.Count("darts", 1)
+	stats.Count("darts", 1)
+	stats.Count("darts", 1)
+	stats.Count("darts", 4)
+	stats.Value("players", 2, time.Now())
+	stats.Duration("quickest time", time.Millisecond)
 
 	time.Sleep(200 * time.Millisecond)
-	pool.Stop()
+	stats.Stop()
 
 	var p Payload
 
@@ -72,28 +74,34 @@ func TestStatPool(t *testing.T) {
 
 	for _, stat := range p.Data {
 		switch stat.Key {
-		case "darts":
+		case "prefix:darts":
 			if stat.Count != 7 {
 				t.Errorf("Expected: 7, got: %d", stat.Count)
 			}
 			if stat.Timestamp == 0 {
 				t.Errorf("Did not get a valid timestamp")
 			}
-		case "players":
+		case "prefix:players":
 			if stat.Value != 2 {
 				t.Errorf("Expected: 2, got: %d", stat.Value)
 			}
 			if stat.Timestamp == 0 {
 				t.Errorf("Did not get a valid timestamp")
 			}
-		case "quickest time":
+		case "prefix:quickest time":
 			if stat.Value != 1000 {
 				t.Errorf("Expected: 1000, got: %d", stat.Value)
 			}
-			if stat.Timestamp == 0 {
-				t.Errorf("Did not get a valid timestamp")
-			}
 		}
 	}
+
+}
+
+func TestNilPool(t *testing.T) {
+
+	stat := NewNilPool()
+	stat.Count("key", 1)
+	stat.Value("key", 1, time.Now())
+	stat.Duration("key", time.Second)
 
 }
