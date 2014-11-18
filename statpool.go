@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -18,6 +17,10 @@ type (
 		ezKey  string
 		url    string
 		client *http.Client
+		log    *log.Logger
+
+		// output stats to
+		devlogger *log.Logger
 
 		// communication
 		stop  chan struct{}
@@ -33,13 +36,13 @@ type (
 	}
 
 	ValueStat struct {
-		StatKey   string  `json:"stat"`
+		Key       string  `json:"stat"`
 		Value     float64 `json:"value"`
 		Timestamp int64   `json:"t,omitempty"`
 	}
 
 	CountStat struct {
-		StatKey   string  `json:"stat"`
+		Key       string  `json:"stat"`
 		Count     float64 `json:"count"`
 		Timestamp int64   `json:"t,omitempty"`
 	}
@@ -52,37 +55,47 @@ func NewPool(url, ezKey string, flushInterval time.Duration) *Pool {
 		url:   url,
 
 		client: &http.Client{},
-		Log:    log.New(ioutil.Discard, "", 0),
+		log:    log.New(os.Stderr, "statpool: ", log.LstdFlags|log.Lshortfile),
 
 		stop:  make(chan struct{}),
 		flush: make(chan struct{}),
 		count: make(chan *CountStat, 512),
 		value: make(chan *ValueStat, 512),
+
+		counts: map[string]*CountStat{},
+		values: []interface{}{},
 	}
 
 	go func() {
 		tick := time.NewTicker(flushInterval)
 		for {
 			select {
-			case <-stop:
-				p.Log.Println("exiting")
+			case <-p.stop:
+				p.log.Println("exiting")
+				tick.Stop()
 				return
-			case <-flush:
-				if err := p.flush(); err != nil {
-					p.Log.Println(err)
+			case <-p.flush:
+				if p.devlogger != nil {
+					p.devlogger.Println("flushing")
 				}
-			case <-tick:
-				if err := p.flush(); err != nil {
-					p.Log.Println(err)
+				if err := p.doflush(); err != nil {
+					p.log.Println(err)
 				}
-			case v := <-count:
-				if stat, exists := p.counts[v.StatKey]; exists {
+			case <-tick.C:
+				if p.devlogger != nil {
+					p.devlogger.Println("tick")
+				}
+				if err := p.doflush(); err != nil {
+					p.log.Println(err)
+				}
+			case v := <-p.count:
+				if stat, exists := p.counts[v.Key]; exists {
 					stat.Count += v.Count
 				} else {
-					p.counts[v.StatKey] = v
+					p.counts[v.Key] = v
 					p.values = append(p.values, v)
 				}
-			case v := <-value:
+			case v := <-p.value:
 				p.values = append(p.values, v)
 			}
 		}
@@ -91,11 +104,16 @@ func NewPool(url, ezKey string, flushInterval time.Duration) *Pool {
 	return p
 }
 
-func (p *Pool) Verbose() {
-	p.Log = log.New(os.Stderr, "statpool: ", p.Log.LstdFlags)
-}
+func (p *Pool) doflush() error {
 
-func (p *Pool) flush() error {
+	if p.devlogger != nil {
+		p.devlogger.Println("doflush")
+	}
+
+	// if no work just return
+	if len(p.counts) == 0 && len(p.values) == 0 {
+		return nil
+	}
 
 	// set the flush time as the aggregated count time
 	now := time.Now().Unix()
@@ -130,13 +148,13 @@ func (p *Pool) flush() error {
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		p.Log.Println("unprocessed aggregate:", buf.String())
+		p.log.Println("unprocessed aggregate:", buf.String())
 		return err
 	}
 	resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		p.Log.Println("unprocessed aggregate:", buf.String())
+		p.log.Println("unprocessed aggregate:", buf.String())
 		return fmt.Errorf("Received http status code: %d from stathat", resp.StatusCode)
 	}
 
@@ -145,29 +163,60 @@ func (p *Pool) flush() error {
 }
 
 func (p *Pool) Count(key string, val float64) {
+	if p.devlogger != nil {
+		p.devlogger.Printf("%s:%g", key, val)
+	}
 	stat := &CountStat{
-		StatKey: key,
-		Count:   val,
+		Key:   key,
+		Count: val,
 	}
 	select {
 	case p.count <- stat:
 	default:
-		p.Log.Printf("channels backed up, dropping stat: %+v", stat)
+		p.log.Printf("channels backed up, dropping stat: %+v", stat)
 	}
 }
 
 func (p *Pool) Value(key string, val float64, timestamp time.Time) {
+	if p.devlogger != nil {
+		p.devlogger.Printf("%s:%g", key, val)
+	}
 	stat := &ValueStat{
-		StatKey: key,
-		Value:   val,
+		Key:       key,
+		Value:     val,
+		Timestamp: timestamp.Unix(),
 	}
 	select {
 	case p.value <- stat:
 	default:
-		p.Log.Printf("channels backed up, dropping stat: %+v", stat)
+		p.log.Printf("channels backed up, dropping stat: %+v", stat)
 	}
+}
+
+func (p *Pool) Duration(key string, val time.Duration, timestamp time.Time) {
+	if p.devlogger != nil {
+		p.devlogger.Printf("%s:%s", key, val)
+	}
+	stat := &ValueStat{
+		Key:       key,
+		Value:     float64(val.Nanoseconds()) / 1000, // track milliseconds
+		Timestamp: timestamp.Unix(),
+	}
+	select {
+	case p.value <- stat:
+	default:
+		p.log.Printf("channels backed up, dropping stat: %+v", stat)
+	}
+}
+
+func (p *Pool) SetDevLogger(l *log.Logger) {
+	p.devlogger = l
 }
 
 func (p *Pool) Stop() {
 	p.stop <- struct{}{}
+}
+
+func (p *Pool) Flush() {
+	p.flush <- struct{}{}
 }
