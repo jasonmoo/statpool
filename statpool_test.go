@@ -5,6 +5,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/http/httptest"
 	"os"
 
 	"testing"
@@ -23,28 +24,21 @@ type (
 	}
 )
 
-const (
-	EZKey = "finchbasket"
-	Host  = ":8000"
-)
+const EZKey = "finchbasket"
 
-var reqs = make(chan []byte, 1)
-
-func init() {
-
-	// set up test listener
-	http.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
+var (
+	reqs = make(chan []byte, 1)
+	ts   = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		// pass body bytes since req.Body auto-closes on handler end
 		data, _ := ioutil.ReadAll(req.Body)
 		reqs <- data
 		json.NewEncoder(w).Encode(&statResponse{Status: http.StatusOK})
-	})
-	go func() { log.Fatal(http.ListenAndServe(Host, nil)) }()
-}
+	}))
+)
 
 func TestStatPool(t *testing.T) {
 
-	stats := NewPool("http://"+Host, EZKey, 100*time.Millisecond)
+	stats := NewPool(ts.URL, EZKey, 100*time.Millisecond)
 	stats.SetDevLogger(log.New(os.Stderr, "statpool: ", log.LstdFlags))
 	stats.SetPrefix("prefix:")
 
@@ -54,6 +48,7 @@ func TestStatPool(t *testing.T) {
 	stats.Count("darts", 4)
 	stats.Value("players", 2, time.Now())
 	stats.Duration("quickest time", time.Millisecond)
+	stats.SampledDuration("sampled time", time.Millisecond, 1)
 
 	time.Sleep(200 * time.Millisecond)
 	stats.Stop()
@@ -88,9 +83,10 @@ func TestStatPool(t *testing.T) {
 			if stat.Timestamp == 0 {
 				t.Errorf("Did not get a valid timestamp")
 			}
-		case "prefix:quickest time":
-			if stat.Value != 1000 {
-				t.Errorf("Expected: 1000, got: %d", stat.Value)
+		case "prefix:quickest time",
+			"prefix:sampled time":
+			if stat.Value != 1 {
+				t.Errorf("Expected: 1, got: %d", stat.Value)
 			}
 		}
 	}
@@ -103,5 +99,6 @@ func TestNilPool(t *testing.T) {
 	stat.Count("key", 1)
 	stat.Value("key", 1, time.Now())
 	stat.Duration("key", time.Second)
+	stat.SampledDuration("key", time.Second, 1)
 
 }

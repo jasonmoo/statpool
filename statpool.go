@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
+	"sync"
 
 	"time"
 )
@@ -29,20 +31,15 @@ type (
 		devlogger *log.Logger
 
 		// communication
-		stop  chan struct{}
-		done  chan struct{}
-		flush chan struct{}
-		count chan *CountStat
-		value chan *ValueStat
+		stop     chan struct{}
+		done     chan struct{}
+		flush    chan struct{}
+		flushing sync.WaitGroup
+		count    chan *CountStat
+		value    chan *ValueStat
 
 		// prefix all keys with
 		prefix string
-
-		// counts for aggregation
-		counts map[string]*CountStat
-
-		// all values for output
-		values []interface{}
 	}
 
 	ValueStat struct {
@@ -81,57 +78,111 @@ func NewPool(url, ezKey string, flushInterval time.Duration) *Pool {
 		client: &http.Client{},
 		log:    log.New(os.Stderr, "statpool: ", log.LstdFlags),
 
-		stop:  make(chan struct{}),
-		done:  make(chan struct{}),
-		flush: make(chan struct{}),
+		flush:    make(chan struct{}),
+		flushing: sync.WaitGroup{},
+		stop:     make(chan struct{}),
+
 		count: make(chan *CountStat, 512),
 		value: make(chan *ValueStat, 512),
-
-		counts: map[string]*CountStat{},
-		values: []interface{}{},
 	}
 
 	go func() {
-		tick := time.NewTicker(flushInterval)
+
+		var (
+			values = []interface{}{}
+			counts = map[string]*CountStat{}
+			tick   = time.NewTicker(flushInterval)
+
+			rotate_values = func() []interface{} {
+				stats := values
+				values = []interface{}{}
+				counts = map[string]*CountStat{}
+				return stats
+			}
+
+			doflush = func(stats []interface{}) {
+				if err := p.doflush(stats); err != nil {
+					p.log.Println(err)
+				}
+				p.flushing.Done()
+			}
+		)
+
 		for {
 			select {
-			case <-p.stop:
-				p.log.Println("exiting")
-				tick.Stop()
-				if err := p.doflush(); err != nil {
-					p.log.Println(err)
-				}
-				p.done <- struct{}{}
-				return
-			case <-p.flush:
-				if p.devlogger != nil {
-					p.devlogger.Println("flushing")
-				}
-				if err := p.doflush(); err != nil {
-					p.log.Println(err)
-				}
-				p.done <- struct{}{}
-			case <-tick.C:
-				if p.devlogger != nil {
-					p.devlogger.Println("tick")
-				}
-				if err := p.doflush(); err != nil {
-					p.log.Println(err)
-				}
 			case v := <-p.count:
-				if stat, exists := p.counts[v.Key]; exists {
+				if stat, exists := counts[v.Key]; exists {
 					stat.Count += v.Count
 				} else {
-					p.counts[v.Key] = v
-					p.values = append(p.values, v)
+					counts[v.Key] = v
+					values = append(values, v)
 				}
+
 			case v := <-p.value:
-				p.values = append(p.values, v)
+				values = append(values, v)
+
+			case <-tick.C:
+				p.flushing.Add(1) // add one so ending done call doesn't panic
+				go doflush(rotate_values())
+
+			case <-p.stop:
+				tick.Stop()
+				doflush(rotate_values())
+				return
+
+			case <-p.flush:
+				doflush(rotate_values())
 			}
 		}
 	}()
 
 	return p
+}
+
+func (p *Pool) SendCount(stat *CountStat) {
+	select {
+	case p.count <- stat:
+	default:
+		p.log.Printf("channels backed up, dropping stat: %+v", stat)
+	}
+}
+
+func (p *Pool) SendValue(stat *ValueStat) {
+	select {
+	case p.value <- stat:
+	default:
+		p.log.Printf("channels backed up, dropping stat: %+v", stat)
+	}
+}
+
+func (p *Pool) Count(key string, val float64) {
+	if p.devlogger != nil {
+		p.devlogger.Printf("%s%s:%g", p.prefix, key, val)
+	}
+	p.SendCount(&CountStat{Key: p.prefix + key, Count: val})
+}
+
+func (p *Pool) Value(key string, val float64, timestamp time.Time) {
+	if p.devlogger != nil {
+		p.devlogger.Printf("%s%s:%g", p.prefix, key, val)
+	}
+	p.SendValue(&ValueStat{Key: p.prefix + key, Value: val, Timestamp: timestamp.Unix()})
+}
+
+func (p *Pool) Duration(key string, val time.Duration) {
+	if p.devlogger != nil {
+		p.devlogger.Printf("%s%s:%s", p.prefix, key, val)
+	}
+	p.SendValue(&ValueStat{Key: p.prefix + key, Value: float64(val) / float64(time.Millisecond)})
+}
+
+func (p *Pool) SampledDuration(key string, val time.Duration, rate float64) {
+	if p.devlogger != nil {
+		p.devlogger.Printf("%s%s:%s", p.prefix, key, val)
+	}
+	if rate < rand.Float64() {
+		p.SendValue(&ValueStat{Key: p.prefix + key, Value: float64(val) / float64(time.Millisecond)})
+	}
 }
 
 func (p *Pool) SetPrefix(prefix string) {
@@ -143,42 +194,44 @@ func (p *Pool) SetDevLogger(l *log.Logger) {
 }
 
 func (p *Pool) Stop() {
+	p.flushing.Add(1)
 	p.stop <- struct{}{}
-	<-p.done
+	p.flushing.Wait()
 }
 
 func (p *Pool) Flush() {
+	p.flushing.Add(1)
 	p.flush <- struct{}{}
-	<-p.done
+	p.flushing.Wait()
 }
 
-func (p *Pool) doflush() error {
+func (p *Pool) doflush(values []interface{}) error {
 
+	var start time.Time
 	if p.devlogger != nil {
 		p.devlogger.Println("doflush")
+		start = time.Now()
+		defer func() { p.devlogger.Printf("flush completed in %s", time.Since(start)) }()
 	}
 
 	// if no work just return
-	if len(p.counts) == 0 && len(p.values) == 0 {
+	if len(values) == 0 {
 		return nil
 	}
 
 	// set the flush time as the aggregated count time
 	now := time.Now().Unix()
-	for _, count := range p.counts {
-		count.Timestamp = now
+	for _, val := range values {
+		if count, ok := val.(*CountStat); ok {
+			count.Timestamp = now
+		}
 	}
-
-	// grab values and reset
-	values := p.values
-	p.values = []interface{}{}
-	p.counts = map[string]*CountStat{}
 
 	// chunk the sends to ensure data size is not excessive
 	var chunks [][]interface{}
-	for i := 0; i+chunkSize < len(values); i += chunkSize {
-		chunks = append(chunks, values[:i+chunkSize])
-		values = values[i+chunkSize:]
+	for len(values) > chunkSize {
+		chunks = append(chunks, values[:chunkSize])
+		values = values[chunkSize:]
 	}
 	chunks = append(chunks, values)
 
@@ -197,52 +250,6 @@ func (p *Pool) doflush() error {
 
 	return nil
 
-}
-
-func (p *Pool) Count(key string, val float64) {
-	if p.devlogger != nil {
-		p.devlogger.Printf("%s%s:%g", p.prefix, key, val)
-	}
-	stat := &CountStat{
-		Key:   p.prefix + key,
-		Count: val,
-	}
-	select {
-	case p.count <- stat:
-	default:
-		p.log.Printf("channels backed up, dropping stat: %+v", stat)
-	}
-}
-
-func (p *Pool) Value(key string, val float64, timestamp time.Time) {
-	if p.devlogger != nil {
-		p.devlogger.Printf("%s%s:%g", p.prefix, key, val)
-	}
-	stat := &ValueStat{
-		Key:       p.prefix + key,
-		Value:     val,
-		Timestamp: timestamp.Unix(),
-	}
-	select {
-	case p.value <- stat:
-	default:
-		p.log.Printf("channels backed up, dropping stat: %+v", stat)
-	}
-}
-
-func (p *Pool) Duration(key string, val time.Duration) {
-	if p.devlogger != nil {
-		p.devlogger.Printf("%s%s:%s", p.prefix, key, val)
-	}
-	stat := &ValueStat{
-		Key:   p.prefix + key,
-		Value: float64(val.Nanoseconds()) / 1000, // track milliseconds
-	}
-	select {
-	case p.value <- stat:
-	default:
-		p.log.Printf("channels backed up, dropping stat: %+v", stat)
-	}
 }
 
 func (p *Pool) send(chunk []interface{}, errs chan error) {
