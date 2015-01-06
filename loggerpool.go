@@ -10,8 +10,8 @@ type LoggerPool struct {
 	l *log.Logger
 }
 
-func NewLoggerPool(logger *log.Logger) LoggerPool {
-	return LoggerPool{l: logger}
+func NewLoggerPool(logger *log.Logger) *LoggerPool {
+	return &LoggerPool{l: logger}
 }
 
 func (l *LoggerPool) Count(key string, val float64) {
